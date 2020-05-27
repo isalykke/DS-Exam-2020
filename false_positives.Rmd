@@ -1,0 +1,183 @@
+---
+title: "Identifying Characteristics of False Positives from a Flower Detection Network"
+author: "Isa Lykke Hansen"
+date: "5/15/2020"
+output: html_document
+---
+
+Load packages
+```{r setup, include=FALSE}
+setwd("/Users/isalykkehansen/Desktop/Git/Data-Science-Exam-2020/analysis")
+library(pacman)
+p_load(tidyverse, cvms, groupdata2, knitr, doParallel, lmerTest, bbmle, car, GGally, xtable)
+set.seed(1991)
+```
+
+Data wrangling
+```{r}
+metadata <- read.csv("metadata.csv") 
+
+#find mean Q values for false and true positives
+Q_data <- filter(metadata, Q != "NA") %>% 
+  group_by(false_pos) %>% 
+  summarise(Q_mean = mean(Q))
+
+#assign the means to the 73 imgs with missing Q values:
+data <- metadata %>%
+  mutate(Q = ifelse(is.na(Q) & false_pos ==1, Q_data$Q_mean[2], Q)) %>% 
+  mutate(Q = ifelse(is.na(Q) & false_pos ==0, Q_data$Q_mean[1], Q)) 
+```
+
+Multicollinearity check
+```{r}
+#look at multicollenearity btw variables
+multicol <- data %>% 
+  select(4:14, -c(location, false_pos))
+
+X<-multicol
+ggpairs(X)
+
+```
+
+Cross validation 
+```{r}
+#find all possible combinations of predictors
+model_formulas = combine_predictors("false_pos", c("size", "ratio", "blur", "ICLS50", "Q"), max_interaction_size = 2)
+#run CV in parallel
+registerDoParallel(7)
+
+cv1data <- data
+#create folds for cvms (only run once to find best models)
+cv1data <- fold(data, k = 10, cat_col = 'false_pos', 
+             id_col = 'X')
+
+CV <- cross_validate(cv1data, model_formulas,
+                     fold_cols = '.folds',
+                     family = 'binomial',
+                     REML = FALSE,
+                     parallel = TRUE)
+
+#write_csv(CV[1:15], "CV_size_ratio_blur_ICLS50_Q_2way.csv")
+
+
+#arrange the models in order - best on top
+arranged_BA = arrange(CV, desc(`Balanced Accuracy`))
+
+#show the whole model and only one metric
+select_definitions(arranged_BA, additional_includes = "Balanced Accuracy")
+
+#extract the model formulas of the best 100 models
+best_model_formulas = reconstruct_formulas(arranged_BA, topn = 100)
+```
+
+CV of best 100 models
+```{r}
+cv2data <- data
+
+#create folds for repeated cvms
+cv2data <- fold(cv2data, k = 10, cat_col = 'false_pos', 
+             id_col = 'X', num_fold_cols = 5)
+
+#cross validate on the folds
+CV2way <- cross_validate(cv2data, best_model_formulas,
+                     fold_cols = c('.folds_1', '.folds_2', '.folds_3', '.folds_4', '.folds_5'),
+                     family = 'binomial',
+                     REML = FALSE,
+                     parallel = TRUE)
+
+#inspect the models
+arranged_BA = arrange(CV2way, desc(`Balanced Accuracy`))
+top100 <- select_definitions(arranged_BA, additional_includes = c("Balanced Accuracy", "AUC"))
+top_10 = reconstruct_formulas(arranged_BA, topn = 10)
+
+best_model <- as.data.frame(arranged_BA[1,2:9])
+print(xtable(best_model, type = "latex"), file = "best model.tex")
+
+```
+
+model evaluation
+```{r}
+topmodel <- glm(false_pos ~ blur * Q + blur * size + ICLS50 * Q + ICLS50 * size + Q * size + ratio * size, family = "binomial", data = data)
+
+anova(topmodel)
+summary(topmodel)
+
+vif = as.data.frame(vif(topmodel))
+column <- ('1/vif' = 1/vif[,1])
+vif_stats <- cbind(vif, column)
+print(xtable(vif_stats, type = "latex"), file = "vif_stats.tex")
+
+model_coefs <-summary.glm(topmodel)$coefficients
+model_coefs <-as.data.frame(model_coefs) %>% 
+  select(-'z value')
+model_coefs$Estimate <- round(model_coefs$Estimate, 2)
+round(model_coefs, 5)
+
+print(xtable(model_coefs, type = "latex"), file = "model_coefs.tex")
+
+logisticpseudoR2s <- function(logisticmodel) {
+  deviance <- logisticmodel$deviance #extract model deviance
+  nulldeviance <- logisticmodel$null.deviance #extract baseline model deviance
+  modelN <- length(logisticmodel$fitted.values) #compute sample size
+  R.l <- 1 - deviance/nulldeviance  # Hosmer and Lemeshow's R2 is computed
+  R.cs <- 1- exp(-(nulldeviance-deviance)/modelN) # Cox and Snell R2
+  R.n <- R.cs / (1 - (exp(-(nulldeviance/modelN)))) # Nagelkerke R2
+  cat("Pseudo R2 for logistic regression\n")
+  cat("Hosmer & Lemeshow's R2    ", round(R.l,3), "\n")
+  cat("Cox and Snell's R2    ", round(R.cs,3), "\n")
+  cat("Nagelkerke's R2    ", round(R.n,3), "\n")
+}
+
+logisticpseudoR2s(topmodel)
+
+```
+
+Predictive checks across locations
+```{r}
+
+loc_0 <- data %>% dplyr::filter(location == "NARS")
+loc_1 <- data %>% dplyr::filter(location == "THUL")
+
+# Best model from cross-validation find this first
+#maybe by runnning all predictors once and then runnning the best ten models with 10 folds cross validation or smth
+model <- glm(false_pos ~ blur * Q + blur * size + ICLS50 * Q + ICLS50 * size + Q * size + ratio * size, family = "binomial", data = loc_0)
+
+# Get predictions on the loc_0 data
+predictions <- data.frame(
+  "prediction" = predict(model, newdata = loc_1, type="response"), #probabilities plzzz
+  "target" = loc_1$false_pos
+)
+
+
+# Evaluate predictions
+eval <- evaluate(predictions, 
+                 target_col="target", 
+                 prediction_cols="prediction",
+                 type="binomial")
+
+Nars_vs_Thul <- as.data.frame(eval[1:9])
+print(xtable(Nars_vs_Thul, type = "latex"), file = "Nars_vs_Thul.tex")
+
+```
+
+
+Visualising interaction terms
+```{r}
+data <- mutate(data, false_pos = as.factor(false_pos))
+# Setting up the building blocks
+basic_plot <- ggplot(data,
+       aes(x = size,
+           y = ratio,
+           color = false_pos)) +
+  theme_bw() +
+  labs(x = "Size",
+       y = "Ratio",
+       color = "False Positive")
+
+# Colored scatterplot
+basic_plot +
+  geom_point(alpha = .3, 
+             size = .9) +
+  geom_smooth(method = "lm")
+```
+
